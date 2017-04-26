@@ -6,7 +6,6 @@ from threading import Lock
 from intervaltree import IntervalTree
 
 from yargy.tokenizer import Token, Tokenizer
-from yargy.pipeline import PipelineStatus
 from yargy.normalization import NormalizationType
 from yargy.utils import get_tokens_position
 
@@ -54,50 +53,7 @@ class Stack(list):
 class Operation(object):
 
     def __init__(self, *grammars):
-        self.matches = []
-        self.grammars = [
-            create_or_copy_grammar(grammar) 
-            for grammar in grammars
-        ]
-        self.working = self.grammars
- 
-    def reset(self):
-        self.matches = []
-        self.working = self.grammars
-        for grammar in self.working:
-            if grammar.stack:
-                grammar.reset()
-
-    def shift(self, token):
-        recheck = any([
-            grammar.shift(token)
-            for grammar in self.working
-        ])
-        self.update_working()
-        return recheck or bool(self.matches and not self.working)
-
-    def reduce(self, end_of_stream=False):
-        for grammar in self.working:
-            match = grammar.reduce(end_of_stream=end_of_stream)
-            if match:
-                self.matches.append(match)
-        self.update_working()
-        if self.matches and (not self.working or end_of_stream):
-            match = max(self.matches, key=len)
-            self.reset()
-            return match
-
-    def update_working(self):
-        self.working = [
-            grammar for grammar in self.working
-            if grammar.active
-        ]
-
-    @property
-    def active(self):
-        return bool(self.matches) or any(
-            grammar.active for grammar in self.working
-        )
+        self.grammars = grammars
 
 
 class OR(Operation):
@@ -105,162 +61,77 @@ class OR(Operation):
     pass
 
 
+class Leaf(object):
+
+    def __init__(self, index=0, stack=None):
+        self.index = index
+        self.stack = stack or Stack()
+
+    def __repr__(self):
+        return 'Leaf(index={0}, stack={1})'.format(self.index, self.stack.flatten())
+
+
 class Grammar(object):
 
-    '''
-    Grammar contains stack and list of rules.
-    When GLR-parser iterates over tokens it calls
-    `shift` & `reduce` methods on each grammar which checks
-    current grammar stack & provided token on current rule
-    when stack contents matches all rules - grammar returns stack,
-    which contains actual text match
-    '''
-
-    def __init__(self, name, rules):
+    def __init__(self, name, grammars):
         self.name = name
-        self.rules = rules + [
+        self.grammars = grammars + [
             {
                 'terminal': True,
-            },
+            }
         ]
+        self.terminal_rule_index = len(self.grammars) - 1
         self.reset()
 
-    def shift(self, token, recheck=False):
-        '''
-        Parser <- [grammar_1, grammar_2]
-                   |
-                   V
-                shift(token_1)
-        Grammar_1 -> []
-        Grammar_2 -> [token_1]
-                   |
-                   V
-                shift(token_2)
-        Grammar_1 -> []
-        Grammar_2 -> [token_1, token_2]
-                   |
-                   V
-                reduce()
-        Grammar_1 -> []
-        Grammar_2 -> [] <-> returns stack [token_1, token_2]
-        '''
-        rule = self.rules[self.index]
+    def shift(self, token, leafs=None):
 
-        # need to clone tokens, because labels can modify
-        # its forms or other attributes
-        token = copy(token)
+        if not leafs:
+            self.leafs.append(Leaf())
 
-        if isinstance(rule, (Operation, Grammar)):
-            recheck = rule.shift(token)
-            if not rule.active:
-                rule.reset()
-                self.reset()
-            return recheck
-        else:
+        for index, leaf in enumerate(leafs or self.leafs):
+
+            rule = self.grammars[leaf.index]
+
             repeatable = rule.get('repeatable', False)
             optional = rule.get('optional', False)
             terminal = rule.get('terminal', False)
-            skip = rule.get('skip', False)
             labels = rule.get('labels', [])
 
-            if terminal:
-                return True
+            token = copy(token)
 
-            if not all(self.match(token, labels)) and not terminal:
-                last_index = self.index
-                recheck = False
-                if optional or (repeatable and self.stack.have_matches_by_rule_index(self.index)):
-                    self.index += 1
-                else:
-                    recheck = True
-                    self.reset()
+            if all(self.match(token, leaf.stack, labels)):
 
-                if (self.index != last_index) and (not recheck or (optional or repeatable)):
-                    # recheck current token on next rule
-                    return self.shift(token, recheck=recheck)
-                else:
-                    self.reset()
-            else:
-                # token matches current rule
                 if not terminal:
-                    # append token to stack if it's not a terminal rule and current rule
-                    # doesn't have 'skip' option
-                    if not skip:
-                        # add additional fields to tokens, like normalization
-                        # and interpretation rules
-                        token.normalization_type = rule.get(
-                            'normalization', NormalizationType.Normalized)
-                        token.interpretation = rule.get('interpretation', None)
-                        # finally append match to stack
-                        self.stack.append((self.index, token))
-                    if not repeatable:
-                        self.index += 1
+                    leaf.stack.append((leaf.index, token))
 
-    def reduce(self, end_of_stream=False):
-        '''
-        Reduce method returns grammar stack if
-        current grammar index equals to last (terminal) rule
-        '''
-        current_rule = self.rules[self.index]
-        terminal_rule = self.rules[-1]
+                if not repeatable and not terminal:
+                    leaf.index += 1
+            else:
+                if (repeatable and leaf.stack.have_matches_by_rule_index(leaf.index)) or optional:
+                    leaf.index += 1
+                    return self.shift(token, leafs=[leaf])
+                else:
+                    del self.leafs[index]
 
-        is_grammar_object = isinstance(current_rule, (Operation, Grammar))
+    def reduce(self):
 
-        if is_grammar_object and current_rule.active:
-            match = current_rule.reduce(end_of_stream=end_of_stream)
-            if match:
-                self.index += 1
-                current_rule = self.rules[self.index]
-                is_grammar_object = isinstance(current_rule, (Operation, Grammar))
-                for token in match.flatten():
-                    self.stack.append((self.index, token))
+        for index, leaf in enumerate(self.leafs):
 
-        if (current_rule == terminal_rule) and self.stack:
-            match = self.stack
-            self.reset()
-            return match
+            # print(leaf, self.terminal_rule_index)
 
-        if end_of_stream and not is_grammar_object:
-            is_repeatable_and_have_matches = (
-                current_rule.get('repeatable', False)
-                and
-                self.stack.have_matches_by_rule_index(self.index)
-            )
-            is_optional = current_rule.get('optional', False)
-            next_rule_is_terminal = (
-                self.rules[self.index + 1] == terminal_rule)
-            if (is_repeatable_and_have_matches or is_optional) and next_rule_is_terminal:
-                match = self.stack
-                self.reset()
-                return match
+            if leaf.index == self.terminal_rule_index:
 
-    @property
-    def active(self):
-        return bool(self.stack) or any(
-            rule.active for rule in self.rules
-            if isinstance(rule, (Operation, Grammar))
-        )
+                del self.leafs[index]
+
+                yield leaf.stack
 
     def reset(self):
-        self.stack = Stack()
-        self.index = 0
-        for rule in self.rules:
-            if isinstance(rule, (Operation, Grammar)):
-                rule.reset()
+        self.leafs = []
 
-    def match(self, token, labels):
-        stack = self.stack.flatten()
+    def match(self, token, stack, labels):
+        stack = stack.flatten()
         for label in labels:
             yield label(token, stack)
-
-    def __copy__(self):
-        return Grammar(self.name, self.rules[:-1])
-
-    def __repr__(self):
-        return 'Grammar(name=\'{name}\', stack={stack})'.format(
-            name=self.name,
-            stack=self.stack,
-        )
 
 
 class Parser(object):
@@ -278,35 +149,20 @@ class Parser(object):
     def extract(self, text, return_flatten_stack=True):
         with self.lock:
             stream = self.tokenizer.transform(text)
-            
+
             for pipeline in self.pipelines:
                 stream = pipeline(stream)
 
             for token in stream:
                 for grammar in self.grammars:
-                    recheck = grammar.shift(token)
-                    match = grammar.reduce()
+                    grammar.shift(token)
 
-                    if match:
-                        if return_flatten_stack:
-                            match = match.flatten()
-                        yield (grammar, match)
+                    matches = grammar.reduce()
 
-                    if recheck:
-                        grammar.shift(token)
-                        match = grammar.reduce()
-
-                        if match:
-                            if return_flatten_stack:
-                                match = match.flatten()
-                            yield (grammar, match)
+                    for match in matches:
+                        yield (grammar, match.flatten())
 
             for grammar in self.grammars:
-                match = grammar.reduce(end_of_stream=True)
-                if match:
-                    if return_flatten_stack:
-                        match = match.flatten()
-                    yield (grammar, match)
                 grammar.reset()
 
 
